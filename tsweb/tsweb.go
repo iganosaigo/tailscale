@@ -54,28 +54,57 @@ func IsProd443(addr string) bool {
 	return port == "443" || port == "https"
 }
 
+// Debug IPs permited range
+type PermitedDebugIP struct {
+	IpRange     []net.IP
+	ProxyHeader bool
+}
+
+// Global flag with initial hosts empty value
+var DebugIP = &PermitedDebugIP{
+	IpRange:     make([]net.IP, 0),
+	ProxyHeader: false,
+}
+
 // AllowDebugAccess reports whether r should be permitted to access
 // various debug endpoints.
 func AllowDebugAccess(r *http.Request) bool {
-	if allowDebugAccessWithKey(r) {
-		return true
-	}
-	if r.Header.Get("X-Forwarded-For") != "" {
-		// TODO if/when needed. For now, conservative:
-		return false
-	}
-	ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
+	remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return false
 	}
-	ip, err := netip.ParseAddr(ipStr)
-	if err != nil {
+	ipStr := remoteAddr
+	proxyFwdHeader := r.Header.Get("X-Forwarded-For")
+
+	if len(DebugIP.IpRange) > 0 {
+		for _, ip := range DebugIP.IpRange {
+			switch {
+			case DebugIP.ProxyHeader:
+				if remoteAddr == "127.0.0.1" && proxyFwdHeader == ip.String() {
+					return true
+				}
+			case remoteAddr == ip.String():
+				return true
+			}
+		}
+		return false
+	} else {
+		if allowDebugAccessWithKey(r) {
+			return true
+		}
+		if r.Header.Get("X-Forwarded-For") != "" {
+			// TODO if/when needed. For now, conservative:
+			return false
+		}
+		ip, err := netip.ParseAddr(ipStr)
+		if err != nil {
+			return false
+		}
+		if tsaddr.IsTailscaleIP(ip) || ip.IsLoopback() || ipStr == envknob.String("TS_ALLOW_DEBUG_IP") {
+			return true
+		}
 		return false
 	}
-	if tsaddr.IsTailscaleIP(ip) || ip.IsLoopback() || ipStr == envknob.String("TS_ALLOW_DEBUG_IP") {
-		return true
-	}
-	return false
 }
 
 func allowDebugAccessWithKey(r *http.Request) bool {

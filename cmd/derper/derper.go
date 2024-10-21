@@ -53,7 +53,7 @@ var (
 	versionFlag = flag.Bool("version", false, "print version and exit")
 	addr        = flag.String("a", ":443", "server HTTP/HTTPS listen address, in form \":port\", \"ip:port\", or for IPv6 \"[ip]:port\". If the IP is omitted, it defaults to all interfaces. Serves HTTPS if the port is 443 and/or -certmode is manual, otherwise HTTP.")
 	httpPort    = flag.Int("http-port", 80, "The port on which to serve HTTP. Set to -1 to disable. The listener is bound to the same IP (if any) as specified in the -a flag.")
-	stunPort    = flag.Int("stun-port", 3478, "The UDP port on which to serve STUN. The listener is bound to the same IP (if any) as specified in the -a flag.")
+	stunAddr    = flag.String("stun-addr", ":3478", "The UDP socket on which to serve STUN. If bind address not specified then listener is bound to the same IP (if any) as specified in the -a flag.")
 	configPath  = flag.String("c", "", "config file path")
 	certMode    = flag.String("certmode", "letsencrypt", "mode for getting a cert. possible options: manual, letsencrypt")
 	certDir     = flag.String("certdir", tsweb.DefaultCertDir("derper-certs"), "directory to store LetsEncrypt certs, if addr's port is :443")
@@ -76,6 +76,8 @@ var (
 	tcpKeepAlive = flag.Duration("tcp-keepalive-time", 10*time.Minute, "TCP keepalive time")
 	// tcpUserTimeout is intentionally short, so that hung connections are cleaned up promptly. DERPs should be nearby users.
 	tcpUserTimeout = flag.Duration("tcp-user-timeout", 15*time.Second, "TCP user timeout")
+	debugHosts     = flag.String("debug-hosts", "", "only these IP addresses are permited for debugging derp node exluding any other method of auth. Format is list separeted with comas")
+	debugProxy     = flag.Bool("debug-proxy", false, "used with debug-ip flag. Allow x-forwarded-for header")
 )
 
 var (
@@ -138,6 +140,29 @@ func writeNewConfig() config {
 	return cfg
 }
 
+func socketAttr(address string) (host string, port string, err error) {
+	host, port, err = net.SplitHostPort(address)
+	if err != nil {
+		log.Fatalf("invalid server address: %v", err)
+	}
+	return host, port, err
+}
+
+func makeDebugIP(addresses string) []net.IP {
+	result := make([]net.IP, 0)
+	splitIP := strings.Split(addresses, ",")
+
+	for _, ip := range splitIP {
+		parsedIP := net.ParseIP(strings.TrimSpace(ip))
+		if parsedIP == nil {
+			log.Fatalf("Invalid debug IP Address list")
+		} else {
+			result = append(result, parsedIP)
+		}
+	}
+	return result
+}
+
 func main() {
 	flag.Parse()
 	if *versionFlag {
@@ -154,14 +179,27 @@ func main() {
 		tsweb.DevMode = true
 	}
 
-	listenHost, _, err := net.SplitHostPort(*addr)
-	if err != nil {
-		log.Fatalf("invalid server address: %v", err)
+	listenHost, _, err := socketAttr(*addr)
+	listenStunHost, listenStunPort, err := socketAttr(*stunAddr)
+
+	if *debugHosts != "" {
+		debugIP := makeDebugIP(*debugHosts)
+
+		if len(debugIP) > 0 {
+			tsweb.DebugIP.IpRange = makeDebugIP(*debugHosts)
+		}
+		if *debugProxy {
+			tsweb.DebugIP.ProxyHeader = *debugProxy
+		}
+
 	}
 
 	if *runSTUN {
+		if listenStunHost == "" {
+			listenStunHost = listenHost
+		}
 		ss := stunserver.New(ctx)
-		go ss.ListenAndServe(net.JoinHostPort(listenHost, fmt.Sprint(*stunPort)))
+		go ss.ListenAndServe(net.JoinHostPort(listenStunHost, fmt.Sprint(listenStunPort)))
 	}
 
 	cfg := loadConfig()
@@ -212,7 +250,9 @@ func main() {
 		tsweb.AddBrowserHeaders(w)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(200)
-		io.WriteString(w, `<html><body>
+		io.WriteString(w, `<html><body>`)
+		if tsweb.AllowDebugAccess(r) {
+			io.WriteString(w, `
 <h1>DERP</h1>
 <p>
   This is a <a href="https://tailscale.com/">Tailscale</a> DERP server.
@@ -225,12 +265,13 @@ func main() {
   <li><a href="https://pkg.go.dev/tailscale.com/derp">Protocol & Go docs</a></li>
   <li><a href="https://github.com/tailscale/tailscale/tree/main/cmd/derper#derp">How to run a DERP server</a></li>
 </ul>
-`)
-		if !*runDERP {
-			io.WriteString(w, `<p>Status: <b>disabled</b></p>`)
-		}
-		if tsweb.AllowDebugAccess(r) {
-			io.WriteString(w, "<p>Debug info at <a href='/debug/'>/debug/</a>.</p>\n")
+			`)
+			if !*runDERP {
+				io.WriteString(w, `<p>Status: <b>disabled</b></p>`)
+			}
+			io.WriteString(w, `<p>Debug info at <a href='/debug/'>/debug/</a>.</p>\n`)
+		} else {
+			io.WriteString(w, "<h1>Hello World!</h1>")
 		}
 	}))
 	mux.Handle("/robots.txt", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
